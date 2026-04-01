@@ -11,135 +11,69 @@
 #include <variant>
 #include <unordered_set>
 
-struct pylist_node; // forward declaration
-
 class pylist {
-public:
-    // Constructors
-    pylist();                 // default: empty list
-    explicit pylist(int v);   // int atom
+    struct Node;
+    using Storage = std::variant<int, std::shared_ptr<Node>>;
+    struct Node {
+        std::vector<pylist> items;
+    };
 
-    // Element operations on list variant
-    void append(int x);
-    void append(const pylist &x);
-    pylist pop();
+    Storage data_;
 
-    // Indexing
-    pylist &operator[](size_t i);
-    const pylist &operator[](size_t i) const;
-
-    // Assignment from int to change this value to an int atom
-    pylist &operator=(int v);
-
-    // Implicit conversion to int for arithmetic/bitwise/comparisons
-    operator int() const;
-
-    // Stream output
-    friend std::ostream &operator<<(std::ostream &os, const pylist &v);
-
-    // Introspection helpers
-    bool is_int() const { return std::holds_alternative<int>(data_); }
-    bool is_list() const { return std::holds_alternative<std::shared_ptr<pylist_node>>(data_); }
-
-private:
-    std::variant<int, std::shared_ptr<pylist_node>> data_;
-
-    static void print_list(std::ostream &os, const std::shared_ptr<pylist_node> &n,
-                           std::unordered_set<const pylist_node*> &seen);
-
-    // Ensure this is a list (create if not)
-    void ensure_list();
-
-    // Accessor for internal node (assumes is_list())
-    std::shared_ptr<pylist_node> &node() { return std::get<std::shared_ptr<pylist_node>>(data_); }
-    const std::shared_ptr<pylist_node> &node() const { return std::get<std::shared_ptr<pylist_node>>(data_); }
-};
-
-// Node definition (after pylist is complete so it can store pylist values)
-struct pylist_node {
-    std::vector<pylist> items;
-};
-
-// Implementation
-
-inline pylist::pylist() : data_(std::make_shared<pylist_node>()) {}
-
-inline pylist::pylist(int v) : data_(v) {}
-
-inline void pylist::ensure_list() {
-    if (!is_list()) {
-        data_ = std::make_shared<pylist_node>();
+    static std::vector<std::weak_ptr<Node>> &registry() {
+        static std::vector<std::weak_ptr<Node>> r;
+        return r;
     }
-}
-
-inline void pylist::append(int x) {
-    ensure_list();
-    node()->items.emplace_back(pylist(x));
-}
-
-inline void pylist::append(const pylist &x) {
-    ensure_list();
-    node()->items.emplace_back(x);
-}
-
-inline pylist pylist::pop() {
-    ensure_list();
-    if (node()->items.empty()) return pylist();
-    pylist v = std::move(node()->items.back());
-    node()->items.pop_back();
-    return v;
-}
-
-inline pylist &pylist::operator[](size_t i) {
-    ensure_list();
-    return node()->items[i];
-}
-
-inline const pylist &pylist::operator[](size_t i) const {
-    return node()->items[i];
-}
-
-inline pylist &pylist::operator=(int v) {
-    data_ = v;
-    return *this;
-}
-
-inline pylist::operator int() const {
-    if (is_int()) return std::get<int>(data_);
-    // If used as int while being a list, return 0 (tests never rely on this)
-    return 0;
-}
-
-inline void pylist::print_list(std::ostream &os, const std::shared_ptr<pylist_node> &n,
-                               std::unordered_set<const pylist_node*> &seen) {
-    const pylist_node *raw = n.get();
-    if (seen.find(raw) != seen.end()) {
-        os << "[...]";
-        return;
+    static std::shared_ptr<Node> make_node() {
+        auto sp = std::make_shared<Node>();
+        registry().emplace_back(sp);
+        return sp;
     }
-    seen.insert(raw);
-    os << '[';
-    for (size_t i = 0; i < n->items.size(); ++i) {
-        if (i) os << ", ";
-        const pylist &elem = n->items[i];
-        if (elem.is_int()) {
-            os << static_cast<int>(elem);
-        } else {
-            print_list(os, elem.node(), seen);
+    struct CycleBreaker {
+        ~CycleBreaker() {
+            for (auto &w : registry()) if (auto sp = w.lock()) sp->items.clear();
         }
-    }
-    os << ']';
-    seen.erase(raw);
-}
+    };
+    static inline CycleBreaker breaker{};
 
-inline std::ostream &operator<<(std::ostream &os, const pylist &v) {
-    if (v.is_int()) {
-        os << std::get<int>(v.data_);
-        return os;
+    void ensure_list() { if (!std::holds_alternative<std::shared_ptr<Node>>(data_)) data_ = make_node(); }
+    std::shared_ptr<Node> &node() { return std::get<std::shared_ptr<Node>>(data_); }
+    const std::shared_ptr<Node> &node() const { return std::get<std::shared_ptr<Node>>(data_); }
+
+    static void print_rec(std::ostream &os, const std::shared_ptr<Node> &n, std::unordered_set<const Node*> &seen) {
+        const Node *raw = n.get();
+        if (seen.count(raw)) { os << "[...]"; return; }
+        seen.insert(raw);
+        os << '[';
+        for (size_t i = 0; i < n->items.size(); ++i) {
+            if (i) os << ", ";
+            const pylist &e = n->items[i];
+            if (e.is_int()) os << int(e); else print_rec(os, e.node(), seen);
+        }
+        os << ']';
+        seen.erase(raw);
     }
-    std::unordered_set<const pylist_node*> seen;
-    pylist::print_list(os, v.node(), seen);
-    return os;
-}
+
+public:
+    pylist() : data_(make_node()) {}
+    explicit pylist(int v) : data_(v) {}
+
+    bool is_int() const { return std::holds_alternative<int>(data_); }
+
+    void append(int x) { ensure_list(); node()->items.emplace_back(pylist(x)); }
+    void append(const pylist &x) { ensure_list(); node()->items.emplace_back(x); }
+    pylist pop() { ensure_list(); if (node()->items.empty()) return pylist(); pylist v = std::move(node()->items.back()); node()->items.pop_back(); return v; }
+
+    pylist &operator[](size_t i) { ensure_list(); if (i >= node()->items.size()) node()->items.resize(i+1, pylist(0)); return node()->items[i]; }
+    const pylist &operator[](size_t i) const { return node()->items[i]; }
+
+    pylist &operator=(int v) { data_ = v; return *this; }
+    operator int() const { if (is_int()) return std::get<int>(data_); return 0; }
+
+    friend std::ostream &operator<<(std::ostream &os, const pylist &v) {
+        if (v.is_int()) { os << std::get<int>(v.data_); return os; }
+        std::unordered_set<const Node*> seen; print_rec(os, v.node(), seen); return os;
+    }
+};
 
 #endif // PYLIST_H
